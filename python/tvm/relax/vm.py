@@ -22,12 +22,14 @@ import numpy as np  # type: ignore
 from tvm._ffi import base as _base
 import tvm
 from tvm import relax
+from tvm._ffi import base as _base
 from tvm.ir.module import IRModule
 from tvm.runtime import Device, Module, PackedFunc, container
 from tvm.runtime.object import Object
 from tvm.tir.function import PrimFunc
-from . import _ffi_api
+
 from ..rpc.base import RPC_SESS_MASK
+from . import _ffi_api
 
 
 class Executable(object):
@@ -248,7 +250,8 @@ class VirtualMachine(object):
         # kwargs can be a super set of the required function parameters.
         # We only find the ones that are needed.
         func_arity = self._get_function_arity(func_name)
-        func_params = [self._get_function_param_name(func_name, i) for i in range(func_arity)]
+        func_params = [self._get_function_param_name(
+            func_name, i) for i in range(func_arity)]
         new_args = [None] * len(func_params)
         cnt = 0
         for k in kwargs:
@@ -257,7 +260,8 @@ class VirtualMachine(object):
                 new_args[idx] = kwargs[k]
                 cnt += 1
             else:
-                print(f'Warning: Keyword argument "{k}" is unused in {func_name}')
+                print(
+                    f'Warning: Keyword argument "{k}" is unused in {func_name}')
         assert len(args) + cnt == len(func_params)
         idx = 0
         for i, arg in enumerate(new_args):
@@ -599,7 +603,7 @@ def _split_tir_relax(mod: tvm.IRModule) -> Tuple[tvm.IRModule, tvm.IRModule]:
     for gv in mod.get_global_vars():
         if isinstance(mod[gv], PrimFunc):
             tir_mod[gv] = mod[gv]
-        elif isinstance(mod[gv], relax.Function):
+        elif isinstance(mod[gv], (relax.Function, relax.ExternFunc)):
             rx_mod[gv] = mod[gv]
         else:
             raise TypeError(
