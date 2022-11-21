@@ -189,6 +189,8 @@ class BiasGelu(OnnxOpConverter):
 
         b = inputs[1]
 
+        # assert len(x.shape) == 1, "BiasGelu bias term must be a 1D tensor"
+
         inp = bb.emit_te(topi.add, x, b)
 
         # Declare consts
@@ -313,6 +315,26 @@ class EmbedLayerNormalization(OnnxOpConverter):
         return relax.Tuple([ln, mask_index])        
 
 
+class Gather(OnnxOpConverter):
+    """Operator converter for Gather."""
+
+    @classmethod
+    def _impl_v1(cls, bb, inputs, attr):
+        axis = attr.get("axis", 0)
+        data = inputs[0]
+        indices = inputs[1]
+        return bb.emit_te(topi.take, data, indices, axis)
+
+
+class Concat(OnnxOpConverter):
+    """Operator converter for Concat."""
+
+    @classmethod
+    def _impl_v1(cls, bb, inputs, attr):
+        axis = attr.get("axis", 0)
+        return bb.emit_te(topi.concatenate, inputs, axis)
+
+
 def _get_convert_map(opset):
     return {
         "MatMul": MatMul.get_converter(opset),
@@ -322,6 +344,8 @@ def _get_convert_map(opset):
         "BiasGelu": BiasGelu.get_converter(opset),
         "SkipLayerNormalization": SkipLayerNormalization.get_converter(opset),
         "EmbedLayerNormalization": EmbedLayerNormalization.get_converter(opset),
+        "Gather": Gather.get_converter(opset),
+        "Concat": Concat.get_converter(opset),
     }
 
 
