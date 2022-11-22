@@ -150,9 +150,7 @@ class MatMulBiasGelu(OnnxOpConverter):
         if len(inputs[0].shape) == 2:
             output = bb.emit_te(topi.matmul, inputs[0], bb.normalize(inputs[1]))
         else:
-            transpose = bb.emit_te(topi.transpose, inputs[1], [1, 0])
-            expend = bb.emit_te(topi.expand_dims, transpose, 0)
-            output = bb.emit_te(topi.nn.batch_matmul, inputs[0], expend)
+            output = bb.emit(relax.op.vtx_mm(inputs[0], inputs[1]))
 
         # Add bias
         bias = inputs[2]
