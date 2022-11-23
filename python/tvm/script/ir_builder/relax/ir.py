@@ -22,9 +22,22 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import tvm
 from tvm.ir import Type
+<<<<<<< HEAD
 from tvm.relax import Call, Expr, ExternFunc, TupleGetItem, TupleType, Var, const
 from tvm.relax.struct_info import StructInfo, TensorStructInfo
 from tvm.relax.analysis import get_static_type
+=======
+from tvm.relax import (
+    Call,
+    Expr,
+    ExternFunc,
+    ShapeExpr,
+    TupleGetItem,
+    TupleType,
+    Var,
+    const,
+)
+>>>>>>> vtx_mm relax -> cutlass lowering done
 
 ############################### Operators ###############################
 from tvm.relax.op import (
@@ -63,8 +76,12 @@ from tvm.relax.op import (
     sum,
     tanh,
     unique,
+<<<<<<< HEAD
     variance,
     memory,
+=======
+    vtx_mm,
+>>>>>>> vtx_mm relax -> cutlass lowering done
 )
 from tvm.relax.utils import convert_to_expr
 from tvm.runtime import Object as tvm_Object
@@ -456,4 +473,5 @@ __all__ = [
     "tanh",
     "tensor",
     "variance",
+    "vtx_mm",
 ]
