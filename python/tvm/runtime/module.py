@@ -522,7 +522,11 @@ class Module(object):
 
         if self.imported_modules:
             if enabled("llvm") and llvm_target_string:
+<<<<<<< HEAD
                 path_obj = os.path.join(workspace_dir, f"devc.{global_object_format}")
+=======
+                path_obj = os.path.join(workspace_dir, "devc.o")
+>>>>>>> Hotpatch
                 m = _ffi_api.ModulePackImportsToLLVM(self, is_system_lib, llvm_target_string)
                 m.save(path_obj)
                 files.append(path_obj)
