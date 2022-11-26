@@ -101,6 +101,9 @@ def CallTIRRewrite() -> tvm.ir.transform.Pass:
     """
     return _ffi_api.CallTIRRewrite()  # type: ignore
 
+def VMGraphMemoryPlan() -> tvm.ir.transform.Pass:
+    return _ffi_api.VMGraphMemoryPlan()
+
 
 def VMBuiltinLower() -> tvm.ir.transform.Pass:
     """Lowering generic intrinsic to VM intrinsics.
