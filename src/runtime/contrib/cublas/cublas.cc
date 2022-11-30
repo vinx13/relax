@@ -124,7 +124,9 @@ bool CheckMixPrecisionType(DLDataType in_dtype, DLDataType out_dtype, bool int_s
   if (int_support && TypeMatch(out_dtype, kDLInt, 32)) {
     return TypeMatch(in_dtype, kDLInt, 8);
   } else if (TypeMatch(out_dtype, kDLFloat, 32)) {
-    return TypeMatch(in_dtype, kDLInt, 8) || TypeMatch(in_dtype, kDLFloat, 16);
+    return TypeMatch(in_dtype, kDLInt, 8) || TypeMatch(in_dtype, kDLFloat, 16) || TypeMatch(in_dtype, kDLFloat, 32);
+  } else if (TypeMatch(out_dtype, kDLFloat, 16)) {
+    return TypeMatch(in_dtype, kDLFloat, 16);
   } else {
     return false;
   }
@@ -368,6 +370,137 @@ TVM_REGISTER_GLOBAL("tvm.contrib.cublas.matmul").set_body([](TVMArgs args, TVMRe
 });
 
 #if CUDART_VERSION >= 10010
+void CublasLtBatchGemm(DLTensor* A, DLTensor* B, DLTensor* C, bool transa, bool transb, cublasLtEpilogue_t epilogue, DLTensor* bias) {
+  CuBlasThreadEntry* entry_ptr = CuBlasThreadEntry::ThreadLocal();
+  if (entry_ptr->workspace == nullptr) {
+    entry_ptr->workspace_size = 4 * 1024 * 1024;
+    cudaMalloc(&entry_ptr->workspace, entry_ptr->workspace_size);
+    ICHECK(entry_ptr->workspace != nullptr);
+  }
+
+  ICHECK_EQ(A->ndim, 3);
+  ICHECK_EQ(B->ndim, 3);
+  ICHECK_EQ(C->ndim, 3);
+
+  int batch_size = BatchCount3D(C);
+  ICHECK_EQ(ElementStride3D(A), 1);
+  ICHECK_EQ(ElementStride3D(B), 1);
+  ICHECK_EQ(ElementStride3D(C), 1);
+
+  ICHECK(TypeEqual(A->dtype, B->dtype));
+
+  // C can never be transposed.
+  ICHECK(!IsInPlaceTransposed3D(C));
+
+  // Reversed strides indicates an in-place transpose operation.
+  transa = IsInPlaceTransposed3D(A) ? !transa : transa;
+  transb = IsInPlaceTransposed3D(B) ? !transb : transb;
+
+  // TODO: igemm is not supported
+  ICHECK(CheckMixPrecisionType(A->dtype, C->dtype, /*int_support=*/false)) << "Unsupported data type";
+
+  double alpha = 1.0;
+  double beta = 0.0;
+
+  int64_t A_stride = A->shape[1] * A->shape[2];
+  int64_t B_stride = B->shape[1] * B->shape[2];
+  int64_t C_stride = C->shape[1] * C->shape[2];
+
+  // Broadcast A or B by changing its stride.
+  int batch_size_a = BatchCount3D(A);
+  int batch_size_b = BatchCount3D(B);
+  if (batch_size_a != batch_size_b) {
+    if (batch_size_a == 1) {
+      A_stride = 0;
+    } else if (batch_size_b == 1) {
+      B_stride = 0;
+    }
+  } else {
+    ICHECK_EQ(batch_size_a, batch_size);
+    ICHECK_EQ(batch_size_b, batch_size);
+  }
+
+  cudaDataType_t cuda_in_type = GetCudaDataType(A->dtype);
+  cudaDataType_t cuda_out_type = GetCudaDataType(C->dtype);
+  cublasComputeType_t cublas_compute_type = GetCublasComputeType(C->dtype);
+  void *alpha_ptr = nullptr, *beta_ptr = nullptr;
+  auto alpha_int = static_cast<int32_t>(alpha);
+  auto beta_int = static_cast<int32_t>(beta);
+  auto alpha_float = static_cast<float>(alpha);
+  auto beta_float = static_cast<float>(beta);
+  if (C->dtype.code == kDLInt) {
+    alpha_ptr = &alpha_int;
+    beta_ptr = &beta_int;
+  } else if (C->dtype.code == kDLFloat) {
+    alpha_ptr = &alpha_float;
+    beta_ptr = &beta_float;
+  }
+
+  auto A_data = reinterpret_cast<void*>(static_cast<char*>(A->data) + A->byte_offset);
+  auto B_data = reinterpret_cast<void*>(static_cast<char*>(B->data) + B->byte_offset);
+  auto C_data = reinterpret_cast<void*>(static_cast<char*>(C->data) + C->byte_offset);
+
+  cublasLtMatmulDesc_t op_desc;
+  cublasLtMatrixLayout_t A_desc;
+  cublasLtMatrixLayout_t B_desc;
+  cublasLtMatrixLayout_t C_desc;
+  cublasLtMatmulPreference_t preference;
+  cublasLtMatmulHeuristicResult_t heuristic_result;
+
+  int64_t m = ColumnCount3D(B, transb);
+  int64_t n = RowCount3D(A, transa);
+  int64_t k = ColumnCount3D(A, transa);
+
+  // static bool once = [&]() {
+  // Set data types and layouts
+  CHECK_CUBLAS_ERROR(cublasLtMatmulDescCreate(&op_desc, cublas_compute_type, cuda_out_type));
+  cublasOperation_t cublas_transa = CUBLASBooleanToTranspose(transa);
+  cublasOperation_t cublas_transb = CUBLASBooleanToTranspose(transb);
+  CHECK_CUBLAS_ERROR(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &cublas_transb, sizeof(cublas_transb)));
+  CHECK_CUBLAS_ERROR(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &cublas_transa, sizeof(cublas_transa)));
+
+  // Set input and output shapes
+  CHECK_CUBLAS_ERROR(cublasLtMatrixLayoutCreate(&A_desc, cuda_in_type, !transb ? m : k, !transb ? k : m, ColumnStride3D(B)));
+  CHECK_CUBLAS_ERROR(cublasLtMatrixLayoutCreate(&B_desc, cuda_in_type, !transa ? k : n, !transa ? n : k, ColumnStride3D(A)));
+  CHECK_CUBLAS_ERROR(cublasLtMatrixLayoutCreate(&C_desc, cuda_in_type, m, n, ColumnStride3D(C)));
+
+  // Set batch size
+  CHECK_CUBLAS_ERROR(cublasLtMatrixLayoutSetAttribute(A_desc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_size, sizeof(batch_size)));
+  CHECK_CUBLAS_ERROR(cublasLtMatrixLayoutSetAttribute(A_desc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &A_stride, sizeof(A_stride)));
+  CHECK_CUBLAS_ERROR(cublasLtMatrixLayoutSetAttribute(B_desc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_size, sizeof(batch_size)));
+  CHECK_CUBLAS_ERROR(cublasLtMatrixLayoutSetAttribute(B_desc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &B_stride, sizeof(B_stride)));
+  CHECK_CUBLAS_ERROR(cublasLtMatrixLayoutSetAttribute(C_desc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_size, sizeof(batch_size)));
+  CHECK_CUBLAS_ERROR(cublasLtMatrixLayoutSetAttribute(C_desc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &C_stride, sizeof(C_stride)));
+
+  // tune algo
+  // CHECK_CUBLAS_ERROR(cublasLtMatmulPreferenceCreate(&preference));
+  // size_t workspace_size = 1024*1024*4;
+  // CHECK_CUBLAS_ERROR(cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size, sizeof(workspace_size)));
+  // int returned_result_count = 0;
+  // CHECK_CUBLAS_ERROR(cublasLtMatmulAlgoGetHeuristic(entry_ptr->lt_handle, op_desc, A_desc, B_desc, C_desc, C_desc, preference, 1, &heuristic_result, &returned_result_count));
+  // ICHECK(returned_result_count == 1);
+  // return true;
+  // }();
+
+  // Set epilogue
+  if (epilogue != CUBLASLT_EPILOGUE_DEFAULT) {
+    if (bias != nullptr) {
+      CHECK_EQ(bias->ndim, 1);
+      CHECK_EQ(bias->shape[0], m);
+      auto bias_data = reinterpret_cast<void*>(static_cast<char*>(bias->data) + C->byte_offset);
+      CHECK_CUBLAS_ERROR(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_data, sizeof(bias_data)));
+    }
+    cublasLtEpilogue_t cublas_epilogue = static_cast<cublasLtEpilogue_t>(epilogue);
+    CHECK_CUBLAS_ERROR(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_EPILOGUE, &cublas_epilogue, sizeof(cublas_epilogue)));
+  }
+  CHECK_CUBLAS_ERROR(cublasLtMatmul(entry_ptr->lt_handle, op_desc, alpha_ptr, B_data, A_desc, A_data, B_desc, beta_ptr, C_data, C_desc, C_data, C_desc, nullptr, entry_ptr->workspace, 4*1024*1024, nullptr));
+
+  CHECK_CUBLAS_ERROR(cublasLtMatrixLayoutDestroy(A_desc));
+  CHECK_CUBLAS_ERROR(cublasLtMatrixLayoutDestroy(B_desc));
+  CHECK_CUBLAS_ERROR(cublasLtMatrixLayoutDestroy(C_desc));
+  CHECK_CUBLAS_ERROR(cublasLtMatmulDescDestroy(op_desc));
+}
+
 TVM_REGISTER_GLOBAL("tvm.contrib.cublaslt.matmul").set_body([](TVMArgs args, TVMRetValue* ret) {
   DLTensor* A = args[0];
 
@@ -381,6 +514,18 @@ TVM_REGISTER_GLOBAL("tvm.contrib.cublaslt.matmul").set_body([](TVMArgs args, TVM
   CallLtIgemm(args, ret, ltHandle);
   CHECK_CUBLAS_ERROR(cublasLtDestroy(ltHandle));
 });
+
+TVM_REGISTER_GLOBAL("tvm.contrib.cublaslt.batch_matmul").set_body([](TVMArgs args, TVMRetValue*ret) {
+  DLTensor* A = args[0];
+  DLTensor* B = args[1];
+  DLTensor* C = args[2];
+  bool transa = args[3];
+  bool transb = args[4];
+  cublasLtEpilogue_t epilogue = args.size() > 5 ? static_cast<cublasLtEpilogue_t>(args[5].operator int64_t()) : CUBLASLT_EPILOGUE_DEFAULT;
+  DLTensor* bias = args.size() > 6 ? args[6].operator DLTensor*() : nullptr;
+  CublasLtBatchGemm(A, B, C, transa, transb, epilogue, bias);
+});
+
 #endif  // CUDART_VERSION >= 10010
 
 TVM_REGISTER_GLOBAL("tvm.contrib.cublas.batch_matmul").set_body([](TVMArgs args, TVMRetValue* ret) {

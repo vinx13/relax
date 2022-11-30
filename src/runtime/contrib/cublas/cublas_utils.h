@@ -74,6 +74,9 @@ struct CuBlasThreadEntry {
   CuBlasThreadEntry();
   ~CuBlasThreadEntry();
   cublasHandle_t handle{nullptr};
+  cublasLtHandle_t lt_handle{nullptr};
+  void* workspace{nullptr};
+  int64_t workspace_size{0};
   static CuBlasThreadEntry* ThreadLocal();
 };  // CuBlasThreadEntry
 
@@ -105,6 +108,27 @@ inline cudaDataType_t GetCudaDataType(DLDataType type) {
   LOG(FATAL) << "Unsupported cuda type";
   return CUDA_R_16F;
 }
+
+// Get the cublas compute type for the given output data type. Only consider default
+// modes for the data types (fast computation via downcast is not enabled).
+inline cublasComputeType_t GetCublasComputeType(const DLDataType& out_type) {
+  if (out_type.code == kDLInt || out_type.code == kDLUInt) {
+    return CUBLAS_COMPUTE_32I;
+  }
+  if (out_type.code == kDLFloat) {
+    switch (out_type.bits) {
+      case 16:
+	return CUBLAS_COMPUTE_16F;
+      case 32:
+	return CUBLAS_COMPUTE_32F;
+      case 64:
+	return CUBLAS_COMPUTE_64F;
+    }
+  }
+  LOG(FATAL) << "Unsupported cublas compute type";
+  throw;
+}
+
 }  // namespace contrib
 }  // namespace tvm
 
