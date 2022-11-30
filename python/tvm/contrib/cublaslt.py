@@ -52,3 +52,66 @@ def matmul(lhs, rhs, transa=False, transb=False, n=0, m=0, dtype=None):
         dtype=dtype,
         name="C",
     )
+
+def get_cublas_lt_epilogue(epilogue):
+    r = tvm.get_global_func("tvm.contrib.cublaslt.get_epilogue")(epilogue)
+    print(r)
+    return r
+
+def batch_matmul(lhs, rhs, transa=False, transb=False, b=0, n=0, m=0, dtype=None, bias=None, epilogue="default"):
+    """Create an extern op that compute matrix mult of A and rhs with cuBLAS
+
+    Parameters
+    ----------
+    lhs : Tensor
+        The left matrix operand
+    rhs : Tensor
+        The right matrix operand
+    transa : bool
+        Whether transpose lhs
+    transb : bool
+        Whether transpose rhs
+    b : int
+        The batch size
+    n : int
+        The size of the n dimension
+    m : int
+        The size of the m dimension
+    dtype : str
+        The output data type
+    bias : Optional[Tensor]
+        The optional bias
+    epilogue : Literal["default", "bias", "relu", "gelu", "bias_relu", "bias_gelu"]
+        The epilogue
+
+    Returns
+    -------
+    C : Tensor
+        The result tensor.
+    """
+    if n == 0:
+        n = lhs.shape[2] if transa else lhs.shape[1]
+    if m == 0:
+        m = rhs.shape[1] if transb else rhs.shape[2]
+    if b == 0:
+        b = max(lhs.shape[0], rhs.shape[0])
+    dtype = dtype if dtype is not None else lhs.dtype
+    input_tensors = [lhs, rhs]
+    if bias is not None:
+        input_tensors.append(bias)
+
+    def _get_call_packed_args(ins, outs):
+        args = [ins[0], ins[1], outs[0], transa, transb]
+        if epilogue != "default":
+            args.append(get_cublas_lt_epilogue(epilogue))
+        if bias is not None:
+            args.append(ins[2])
+        return args
+    return te.extern(
+        (b, n, m),
+        input_tensors,
+        lambda ins, outs: tvm.tir.call_packed(
+            "tvm.contrib.cublaslt.batch_matmul", *_get_call_packed_args(ins, outs)),
+        dtype=dtype,
+        name="C",
+    )

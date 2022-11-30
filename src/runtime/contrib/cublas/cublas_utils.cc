@@ -30,12 +30,23 @@
 namespace tvm {
 namespace contrib {
 
-CuBlasThreadEntry::CuBlasThreadEntry() { CHECK_CUBLAS_ERROR(cublasCreate(&handle)); }
+CuBlasThreadEntry::CuBlasThreadEntry() {
+  CHECK_CUBLAS_ERROR(cublasCreate(&handle));
+  CHECK_CUBLAS_ERROR(cublasLtCreate(&lt_handle));
+}
 
 CuBlasThreadEntry::~CuBlasThreadEntry() {
+  if (lt_handle) {
+    cublasLtDestroy(lt_handle);
+    lt_handle = nullptr;
+  }
   if (handle) {
     cublasDestroy(handle);
     handle = nullptr;
+  }
+  if (workspace) {
+    cudaFree(workspace);
+    workspace = nullptr;
   }
 }
 
@@ -47,6 +58,33 @@ CuBlasThreadEntry* CuBlasThreadEntry::ThreadLocal() {
   CHECK_CUBLAS_ERROR(cublasSetStream(retval->handle, static_cast<cudaStream_t>(stream)));
   return retval;
 }
+
+cublasLtEpilogue_t GetCublasLtEpilogue(const String& epilogue_name) {
+  if (epilogue_name == "default") {
+    return CUBLASLT_EPILOGUE_DEFAULT;
+  }
+  if (epilogue_name == "bias") {
+    return CUBLASLT_EPILOGUE_BIAS;
+  }
+  if (epilogue_name == "relu") {
+    return CUBLASLT_EPILOGUE_RELU;
+  }
+  if (epilogue_name == "bias_relu") {
+    return CUBLASLT_EPILOGUE_RELU_BIAS;
+  }
+  if (epilogue_name == "gelu") {
+    return CUBLASLT_EPILOGUE_GELU;
+  }
+  if (epilogue_name == "bias_gelu") {
+    return CUBLASLT_EPILOGUE_GELU_BIAS;
+  }
+  LOG(FATAL) << "Unsupported epilogue " << epilogue_name;
+  throw;
+}
+
+TVM_REGISTER_GLOBAL("tvm.contrib.cublaslt.get_epilogue").set_body_typed([](String epilogue_name) {
+  return static_cast<int64_t>(GetCublasLtEpilogue(epilogue_name));
+});
 
 }  // namespace contrib
 }  // namespace tvm
