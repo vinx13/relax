@@ -28,6 +28,7 @@ import tvm
 from tvm import relax, topi
 from tvm.ir import IRModule
 from tvm.relax import testing
+import tvm.contrib.cublaslt
 
 
 def new_var(var_name, shape, dtype="float32"):
@@ -141,8 +142,9 @@ class MatMul(OnnxOpConverter):
         assert len(inputs) == 2, "MatMul op takes 2 inputs, {} given".format(len(inputs))
         weight = bb.emit_te(topi.transpose, inputs[1], [1, 0])
         weight = bb.emit_te(topi.expand_dims, weight, 0)
-        return bb.emit_te(tvm.contrib.cublas.batch_matmul, inputs[0], bb.normalize(weight), transb=True)
         # return bb.emit(relax.op.vtx_mm(inputs[0], bb.normalize(weight)))
+        # return bb.emit_te(tvm.contrib.cublas.batch_matmul, inputs[0], bb.normalize(weight), transb=True)
+        return bb.emit_te(tvm.contrib.cublaslt.batch_matmul, inputs[0], bb.normalize(weight), transb=True)
 
 
 
@@ -167,8 +169,9 @@ class MatMulBiasGelu(OnnxOpConverter):
                 epilogue_pattern="cutlass.dense_bias_gelu_fp32",
             )
         )
-
         return output
+        # return bb.emit_te(tvm.contrib.cublaslt.batch_matmul, a, b, transb=True, bias=bias, epilogue="bias_gelu")
+
 
 
 class Tanh(OnnxOpConverter):
@@ -406,9 +409,10 @@ class AttentionCutlass(OnnxOpConverter):
 
         weight = bb.emit_te(topi.transpose, weight, [1, 0])
         weight = bb.emit_te(topi.expand_dims, weight, 0)
-        qkv = bb.emit(
-            relax.op.vtx_mm(input_emb, weight, bias, epilogue_pattern="cutlass.dense_bias")
-        )
+        # qkv = bb.emit(
+        #     relax.op.vtx_mm(input_emb, weight, bias, epilogue_pattern="cutlass.dense_bias")
+        # )
+        qkv = bb.emit_te(tvm.contrib.cublaslt.batch_matmul, input_emb, weight, transb=True, bias=bias, epilogue="bias")
 
         qkv = bb.emit(
             relax.call_tir(
