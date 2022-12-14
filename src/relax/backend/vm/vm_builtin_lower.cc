@@ -54,12 +54,6 @@ class VMBuiltinLowerMutator : public ExprMutator {
     }
     return call;
   }
-  static ObjectPtr<BuiltinFuncAttrs> DefaultBuiltinAttrs() {
-    // intiialize with default value
-    auto n = make_object<BuiltinFuncAttrs>();
-    n->InitBySeq();
-    return n;
-  }
 
   Expr ComputeStorageSize(const Expr& shape, const DataType& dtype) const {
     // Question: what if the dtype of tensor_type is unknown?

@@ -56,6 +56,13 @@ struct BuiltinFuncAttrs : public tvm::AttrsNode<BuiltinFuncAttrs> {
   }
 };
 
+inline ObjectPtr<BuiltinFuncAttrs> DefaultBuiltinAttrs() {
+  // intiialize with default value
+  auto n = make_object<BuiltinFuncAttrs>();
+  n->InitBySeq();
+  return n;
+}
+
 }  // namespace relax
 }  // namespace tvm
 #endif  // TVM_RELAX_ATTRS_BUILTIN_H_

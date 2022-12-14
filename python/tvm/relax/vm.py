@@ -570,6 +570,9 @@ def build(
 
     passes = [relax.transform.ToNonDataflow()]
     passes.append(relax.transform.CallTIRRewrite())
+    if target.kind.name == "cuda":
+        passes.append(relax.transform.CanonicalizeBindings())
+        passes.append(relax.transform.RewriteCUDAGraph())
     passes.append(relax.transform.VMBuiltinLower())
     passes.append(relax.transform.VMShapeLower())
     passes.append(relax.transform.AttachGlobalSymbol())

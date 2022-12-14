@@ -428,6 +428,8 @@ class CodeGenVM : public ExprFunctor<Instruction::Arg(const Expr&)> {
     return ret;
   }
 
+  /*! \brief A counter for naming local functions. */
+  size_t local_func_counter_ = 0;
   /*! \brief Internal ExecBuilder. */
   relax::ExecBuilder builder_;
   /*!
@@ -447,6 +449,8 @@ class CodeGenVM : public ExprFunctor<Instruction::Arg(const Expr&)> {
   const Op& unique_op_ = Op::Get("relax.unique");
   const Op& print_op_ = Op::Get("relax.print");
   const Op& assert_op_ = Op::Get("relax.assert_op");
+  const Op& make_closure_op_ = Op::Get("relax.make_closure");
+  const Op& invoke_closure_op_ = Op::Get("relax.invoke_closure");
 };
 
 /*!
