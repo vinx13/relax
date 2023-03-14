@@ -24,38 +24,6 @@
 namespace tvm {
 namespace relax {
 
-/*!
- * \brief Collect bindings that are the output of the funciton.
- */
-class OutputCollector : public ExprVisitor {
- public:
-  static std::unordered_set<const VarNode*> Collect(const Function& func) {
-    OutputCollector collector;
-    collector.VisitExpr(func->body);
-    return collector.outputs_;
-  }
-
-  void VisitExpr_(const VarNode* var) final {
-    if (is_visiting_output_) {
-      outputs_.insert(var);
-    }
-  }
-
-  void VisitExpr_(const SeqExprNode* seq) final {
-    bool is_visiting_output = false;
-    std::swap(is_visiting_output, is_visiting_output_);
-    for (const auto& binding_block : seq->blocks) {
-      VisitBindingBlock(binding_block);
-    }
-    std::swap(is_visiting_output, is_visiting_output_);
-    VisitExpr(seq->body);
-  }
-
- private:
-  std::unordered_set<const VarNode*> outputs_;
-  bool is_visiting_output_ = true;
-};
-
 /*! \brief A statically executed region of the graph. A statically executed region is a region where
  * all the tensors are statically allocated and only contains kernel launches (control flow is not
  * allowed).
@@ -79,7 +47,7 @@ class StaticRegionExtractor : public ExprVisitor {
  public:
   static std::unordered_map<const BindingBlockNode*, std::vector<StaticRegion>> Extract(
       const IRModule& mod, const Function& func) {
-    StaticRegionExtractor extractor(mod, OutputCollector::Collect(func));
+    StaticRegionExtractor extractor(mod, {} /*OutputCollector::Collect(func)*/);
     extractor.VisitExpr(func->body);
     return extractor.block_to_static_regions_;
   }
@@ -136,16 +104,24 @@ class StaticRegionExtractor : public ExprVisitor {
   }
 
   bool IsStaticAlloc(const CallNode* alloc_tensor_call) {
+    LOG(INFO) << alloc_tensor_call->args[0];
     auto shape = Downcast<ShapeExpr>(alloc_tensor_call->args[0]);
-    return std::all_of(shape->values.begin(), shape->values.end(),
-                       [](const PrimExpr& expr) { return expr.as<IntImmNode>() != nullptr; });
+    LOG(INFO) << shape;
+    bool r = std::all_of(shape->values.begin(), shape->values.end(),
+                         [](const PrimExpr& expr) { return expr.as<IntImmNode>() != nullptr; });
+    LOG(INFO) << r;
+    return r;
   }
 
   void VisitBinding_(const VarBindingNode* binding) final {
     ExprVisitor::VisitBinding_(binding);
 
     const Expr& value = binding->value;
-    static const auto& alloc_tensor_op = Op::Get("relax.builtin.alloc_tensor");
+    // static const auto& alloc_tensor_op = Op::Get("relax.builtin.alloc_tensor");
+    static const auto& mem_alloc_storage_op = Op::Get("relax.memory.alloc_storage");
+    static const auto& mem_alloc_tensor_op = Op::Get("relax.memory.alloc_tensor");
+    static const auto& mem_kill_storage_op = Op::Get("relax.memory.kill_storage");
+    static const auto& mem_kill_tensor_op = Op::Get("relax.memory.kill_tensor");
     if (value->IsInstance<VarNode>()) {
       // var -> var re-binding is not needed as we expect the binding is canonicalized
       return;
@@ -155,21 +131,41 @@ class StaticRegionExtractor : public ExprVisitor {
       return;
     }
     if (const auto* call = value.as<CallNode>()) {
-      if (call->op == alloc_tensor_op && IsStaticAlloc(call)) {
+      if (call->op == mem_alloc_storage_op && IsStaticAlloc(call)) {
+        LOG(INFO) << "add " << binding->var;
         scope_.graph.AddBinding(binding, true);
         return;
-      } else if (const auto* gv = call->op.as<GlobalVarNode>()) {
-        auto func = mod_->Lookup(GetRef<GlobalVar>(gv));
-        if (!func->IsInstance<tir::PrimFuncNode>()) {
-          return;
+      } else if (call->op == Op::Get("relax.memory.alloc_tensor")) {
+        scope_.graph.AddBinding(binding, true);
+        return;
+      } else if (const auto* gv = call->op.as<GlobalVarNode>();
+                 gv != nullptr || call->op == Op::Get("relax.memory.alloc_tensor") ||
+                 call->op == Op::Get("relax.memory.kill_tensor") ||
+                 call->op == Op::Get("relax.memory.kill_storage")
+
+      ) {
+        if (gv != nullptr) {
+          auto func = mod_->Lookup(GetRef<GlobalVar>(gv));
+          if (!func->IsInstance<tir::PrimFuncNode>()) {
+            return;
+          }
         }
 
         std::function<bool(const Expr&)> f_is_arg_static = [&](const Expr& arg) -> bool {
           if (const auto* var = arg.as<VarNode>()) {
+            if (!scope_.graph.bindings.count(var)) {
+              return false;
+            }
             return scope_.graph.bindings.count(var);
-          } else if (arg->IsInstance<IntImmNode>() || arg->IsInstance<FloatImmNode>() ||
-                     arg->IsInstance<ConstantNode>()) {
+          } else if (arg->IsInstance<PrimValueNode>() || arg->IsInstance<IntImmNode>() ||
+                     arg->IsInstance<FloatImmNode>() || arg->IsInstance<ConstantNode>() ||
+                     arg->IsInstance<DataTypeImmNode>()) {
             return true;
+          } else if (arg->IsInstance<ShapeExprNode>()) {
+            auto shape = Downcast<ShapeExpr>(arg);
+            return std::all_of(
+                shape->values.begin(), shape->values.end(),
+                [](const PrimExpr& prim_expr) { return prim_expr.as<IntImmNode>() != nullptr; });
           } else if (arg->IsInstance<TupleNode>()) {
             auto tuple = arg.as<TupleNode>();
             return std::all_of(tuple->fields.begin(), tuple->fields.end(), f_is_arg_static);
@@ -192,74 +188,26 @@ class StaticRegionExtractor : public ExprVisitor {
     SummarizeStaticRegion();
   }
 
-  void PruneOutputNodes(DependencyGraph* graph, const std::unordered_set<const VarNode*> outputs) {
-    std::unordered_set<const VarNode*> src_nodes;
-    std::unordered_set<const VarNode*> visited;
-
-    // backward pass to find all alloc_tensor for outputs
-    std::vector<const VarNode*> task_stack{outputs.begin(), outputs.end()};
-    auto f_swim = [&](const VarNode* node) {
-      if (visited.count(node)) return;
-      visited.insert(node);
-      auto it = graph->dep_dst2src.find(node);
-      if (it == graph->dep_dst2src.end()) {
-        src_nodes.insert(node);
-        return;
-      }
-      for (const auto* src : it->second) {
-        task_stack.push_back(src);
-      }
-    };
-    while (!task_stack.empty()) {
-      const VarNode* node = task_stack.back();
-      task_stack.pop_back();
-      f_swim(node);
-    }
-    // forward pass to prune all intermediate bindings involved with output tensors
-    task_stack = {src_nodes.begin(), src_nodes.end()};
-    visited.clear();
-    std::unordered_set<const VarNode*> nodes_to_remove{src_nodes.begin(), src_nodes.end()};
-    auto f_sink = [&](const VarNode* node) {
-      if (visited.count(node)) return;
-      visited.insert(node);
-      auto it = graph->dep_src2dst.find(node);
-      if (it == graph->dep_src2dst.end()) return;
-      for (const auto* dst : it->second) {
-        nodes_to_remove.insert(dst);
-        task_stack.push_back(dst);
-      }
-    };
-    while (!task_stack.empty()) {
-      const VarNode* node = task_stack.back();
-      task_stack.pop_back();
-      f_sink(node);
-    }
-    // remove nodes from the graph
-    for (const auto* node : nodes_to_remove) {
-      graph->bindings.erase(node);
-    }
-    auto f_is_removed = [&](const VarNode* node) { return nodes_to_remove.count(node); };
-    graph->nodes.erase(std::remove_if(graph->nodes.begin(), graph->nodes.end(), f_is_removed),
-                       graph->nodes.end());
-    graph->alloc_tensors.erase(
-        std::remove_if(graph->alloc_tensors.begin(), graph->alloc_tensors.end(), f_is_removed),
-        graph->alloc_tensors.end());
-  }
-
   Function EmitStaticAllocations(BlockBuilderNode* builder, StaticRegion* region) {
     builder->BeginBindingBlock();
-    Array<Expr> alloc_tensors;
-    Array<StructInfo> alloc_tensors_struct_info;
+    Map<Var, Var> var_remap;
+    Array<Expr> alloc_storage_or_tensors;
+    static const auto& mem_alloc_tensor_op = Op::Get("relax.memory.alloc_tensor");
     for (const auto& var : scope_.graph.alloc_tensors) {
-      region->alloc_tensor_to_index.emplace_back(var, alloc_tensors.size());
-      alloc_tensors.push_back(builder->Emit(scope_.graph.bindings.at(var)->value));
-      alloc_tensors_struct_info.push_back(
-          Downcast<StructInfo>(GetRef<Var>(var)->struct_info_.value()));
+      region->alloc_tensor_to_index.emplace_back(var, alloc_storage_or_tensors.size());
+      Call alloc = Downcast<Call>(scope_.graph.bindings.at(var)->value);
+      if (alloc->op.same_as(mem_alloc_tensor_op)) {
+        alloc.CopyOnWrite()->args.Set(0, var_remap.at(Downcast<Var>(alloc->args[0])));
+      }
+
+      auto new_alloc = builder->Emit(alloc);
+      var_remap.Set(GetRef<Var>(var), new_alloc);
+      alloc_storage_or_tensors.push_back(new_alloc);
     }
-    auto output = builder->Emit(Tuple(alloc_tensors));
+    auto output = builder->Emit(Tuple(alloc_storage_or_tensors));
     auto block = builder->EndBlock();
     auto func_body = builder->Normalize(SeqExpr({block}, output));
-    auto func = Function({}, func_body, TupleStructInfo(alloc_tensors_struct_info));
+    auto func = Function({}, func_body, Downcast<StructInfo>(output->struct_info_.value()));
     return func;
   }
 
@@ -283,7 +231,7 @@ class StaticRegionExtractor : public ExprVisitor {
   }
 
   void SummarizeStaticRegion() {
-    PruneOutputNodes(&scope_.graph, outputs_);
+    LOG(INFO) << "End of Scope";
 
     // Find all bindings other than alloc_tensors to emit
     std::vector<VarBinding> bindings_to_emit;
@@ -366,6 +314,7 @@ class CUDAGraphRewriter : public ExprMutator {
           // TupleGetItem is emitted lazily because not all the tensors are needed by the rest of
           // the program
           auto tensor = TupleGetItem(tensors, index);
+          LOG(INFO) << "var_remap_[" << GetRef<Var>(var) << "] = " << tensor;
           var_remap_[var] = {nullptr, std::move(tensor)};
         }
         auto graph = builder_->Emit(TupleGetItem(graph_tensors, 0));
@@ -414,6 +363,7 @@ class CUDAGraphRewriter : public ExprMutator {
 IRModule RewriteCUDAGraph(IRModule mod) {
   CUDAGraphRewriter rewriter(mod);
   mod = rewriter.Rewrite();
+  LOG(INFO) << mod;
   return mod;
 }
 
